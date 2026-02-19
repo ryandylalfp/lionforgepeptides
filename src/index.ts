@@ -31,61 +31,93 @@ function json(data: unknown, status = 200) {
   });
 }
 
+export interface Env {
+  DB: D1Database;
+}
+
+function isValidEmail(email: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
 
-    // Serve landing page
-    if (req.method === "GET" && url.pathname === "/") {
-      return new Response(LANDING_HTML, {
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
-    }
-
-    // Subscribe endpoint
+    // --- EMAIL SIGNUP ---
     if (url.pathname === "/api/subscribe" && req.method === "POST") {
       const contentType = req.headers.get("content-type") || "";
-
       let email = "";
+      let source = "landing";
 
-      // Handle both form submits and JSON fetch
-      if (contentType.includes("application/x-www-form-urlencoded") || contentType.includes("multipart/form-data")) {
+      // Handle form posts
+      if (
+        contentType.includes("application/x-www-form-urlencoded") ||
+        contentType.includes("multipart/form-data")
+      ) {
         const form = await req.formData();
         email = String(form.get("email") || "").trim().toLowerCase();
-        // Optional honeypot
+        source = String(form.get("source") || "landing");
+
+        // Optional honeypot: if filled, silently accept (bot)
         const honeypot = String(form.get("company") || "").trim();
-        if (honeypot) return new Response("OK", { status: 200 }); // silently ignore bots
+        if (honeypot) {
+          return Response.redirect(new URL("/?success=1", url.origin).toString(), 303);
+        }
       } else if (contentType.includes("application/json")) {
-        const body = await req.json().catch(() => ({}));
-        email = String((body as any).email || "").trim().toLowerCase();
+        const body = await req.json().catch(() => ({} as any));
+        email = String(body.email || "").trim().toLowerCase();
+        source = String(body.source || "landing");
       }
 
       if (!email || !isValidEmail(email)) {
-        // If it’s a normal form submit, show a simple page; otherwise JSON
+        // For normal form submits, show a simple error
         if (!contentType.includes("application/json")) {
           return new Response("Please enter a valid email. Go back and try again.", { status: 400 });
         }
-        return json({ ok: false, error: "invalid_email" }, 400);
+        return new Response(JSON.stringify({ ok: false, error: "invalid_email" }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        });
       }
 
-      // Store in KV with a timestamp
-      const key = `email:${email}`;
-      const existing = await env.SUBSCRIBERS.get(key);
-      if (!existing) {
-        await env.SUBSCRIBERS.put(
-          key,
-          JSON.stringify({ email, subscribedAt: new Date().toISOString() })
-        );
-      }
+      // (Optional) capture some metadata for later debugging/anti-abuse
+      const ua = req.headers.get("user-agent") || "";
+      // If you later want real IP info behind proxies, we can add proper CF headers handling.
+      const ip = req.headers.get("cf-connecting-ip") || "";
+      const ipHash = ip ? await sha256(ip) : null;
 
-      // Normal HTML form submit experience: redirect back to home with success flag
+      // Insert (dedupe via UNIQUE email)
+      // If email already exists, this will no-op.
+      await env.DB.prepare(
+        `INSERT INTO subscribers (email, source, ip_hash, user_agent)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(email) DO NOTHING`
+      )
+        .bind(email, source, ipHash, ua)
+        .run();
+
+      // Redirect back for a friendly UX
       if (!contentType.includes("application/json")) {
         return Response.redirect(new URL("/?success=1", url.origin).toString(), 303);
       }
 
-      return json({ ok: true });
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+      });
     }
+
+    // --- your existing routes below ---
+    // e.g. serve landing html at "/"
+    // return new Response(landingHtml, { headers: { "content-type": "text/html" } });
 
     return new Response("Not found", { status: 404 });
   },
 };
+
+// Small helper to hash IP (optional)
+async function sha256(input: string) {
+  const data = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
